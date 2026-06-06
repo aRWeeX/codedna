@@ -36,6 +36,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from shared_llm import MODELS, run_gemini, extract_text_safely
+
 TASKS_FILE   = Path(__file__).parent / "tasks.json"
 PROJECTS_DIR = Path(__file__).parent.parent / "projects_swebench"
 RUNS_DIR     = Path(__file__).parent.parent / "runs"
@@ -276,27 +279,6 @@ def build_result(log: dict, final_text: str, ground_truth: list,
     }
 
 
-# ─────────────────── Retry helper ───────────────────
-
-def call_with_retry(fn, *args, max_attempts=5, **kwargs):
-    """Generic retry with exponential backoff for API calls.
-    BadRequestError (400) is never retried — it indicates a malformed request."""
-    for attempt in range(max_attempts):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            # Don't retry client errors (400) — they won't succeed on retry
-            if "BadRequestError" in type(e).__name__ or "400" in str(e)[:50]:
-                raise
-            if attempt < max_attempts - 1:
-                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s
-                print(f"    ⚠️  API error ({type(e).__name__}), retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("call_with_retry exhausted max_attempts without return/raise")
-
-
 FORCE_FINAL_PROMPT = (
     "You have used all available tool calls. Based on everything you have read so far, "
     "provide your final analysis: list ALL files that need modification and explain the fix."
@@ -315,79 +297,6 @@ def build_initial_message(problem: str, repo_root: Path) -> str:
             "Then start exploring the repository."
         )
     return f"Problem:\n\n{problem}\n\nStart by listing the root directory."
-
-
-# ─────────────────── Provider: Gemini ───────────────────
-
-def run_gemini(problem: str, repo_root: Path, model_id: str, max_turns=15, temperature=0, system_prompt=None) -> dict:
-    try:
-        from google import genai
-        from google.genai import types as gt
-    except ImportError:
-        print("ERROR: pip install google-genai"); sys.exit(1)
-
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        print("ERROR: set GEMINI_API_KEY"); sys.exit(1)
-
-    client = genai.Client(api_key=api_key)
-    fns, log = make_fns(repo_root)
-
-    tools_decl = [gt.Tool(function_declarations=[
-        gt.FunctionDeclaration(name="list_files",
-            description="List files in a directory",
-            parameters=gt.Schema(type="OBJECT", properties={"directory": gt.Schema(type="STRING")})),
-        gt.FunctionDeclaration(name="read_file",
-            description="Read a source file",
-            parameters=gt.Schema(type="OBJECT", required=["path"],
-                                 properties={"path": gt.Schema(type="STRING")})),
-        gt.FunctionDeclaration(name="grep",
-            description="Search for a pattern",
-            parameters=gt.Schema(type="OBJECT", required=["pattern"],
-                                 properties={"pattern": gt.Schema(type="STRING"),
-                                             "directory": gt.Schema(type="STRING")})),
-    ])]
-
-    prompt = system_prompt or SYSTEM_PROMPT
-    config = gt.GenerateContentConfig(system_instruction=prompt,
-                                      tools=tools_decl, temperature=temperature)
-    history = [gt.Content(role="user",
-        parts=[gt.Part(text=build_initial_message(problem, repo_root))])]
-    final_text = ""
-
-    for _ in range(max_turns):
-        resp = call_with_retry(client.models.generate_content,
-                               model=model_id, contents=history, config=config)
-        cand = resp.candidates[0]
-        if not cand.content:
-            break
-        history.append(cand.content)
-        parts = cand.content.parts or []
-        tool_parts = [p for p in parts if p.function_call is not None]
-        if not tool_parts:
-            final_text = "".join(p.text for p in parts if p.text)
-            break
-        results = []
-        for p in tool_parts:
-            fc = p.function_call
-            res = fns[fc.name](**dict(fc.args)) if fc.name in fns else "unknown"
-            results.append(gt.Part(function_response=gt.FunctionResponse(
-                name=fc.name, response={"result": res})))
-        history.append(gt.Content(role="tool", parts=results))
-
-    # Force final summary if agent exhausted max_turns without a text response
-    if not final_text:
-        history.append(gt.Content(role="user",
-            parts=[gt.Part(text=FORCE_FINAL_PROMPT)]))
-        config_no_tools = gt.GenerateContentConfig(system_instruction=prompt,
-                                                    temperature=temperature)
-        resp = call_with_retry(client.models.generate_content,
-                               model=model_id, contents=history, config=config_no_tools)
-        cand = resp.candidates[0]
-        if cand.content:
-            final_text = "".join(p.text for p in cand.content.parts if p.text)
-
-    return log, final_text
 
 
 # ─────────────────── Provider: Anthropic (Claude) ───────────────────

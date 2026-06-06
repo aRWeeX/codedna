@@ -523,6 +523,57 @@ class LLM:
         # Rules: 90s request timeout — DeepSeek occasionally holds open TCP sockets
         # without sending response; without a timeout the whole init pipeline hangs.
         if self._use_litellm:
+            # --- START GEMINI 3.X NATIVE INTERCEPTOR ---
+            if "gemini-3." in self.model:
+                try:
+                    import os
+                    from google import genai
+                    from google.genai import types
+                    
+                    project = os.environ.get("VERTEX_PROJECT")
+                    location = os.environ.get("VERTEX_LOCATION", "global")
+                    
+                    if project:
+                        client = genai.Client(vertexai=True, project=project, location=location)
+                        
+                        config = types.GenerateContentConfig(
+                            max_output_tokens=max_tokens + 1000,
+                            system_instruction="You are an expert software architect. You must ALWAYS return the requested output in text. Do not only return reasoning."
+                        )
+                        
+                        clean_model = self.model.replace("vertex_ai/", "").replace("gemini/", "")
+                        response = client.models.generate_content(
+                            model=clean_model,
+                            contents=prompt,
+                            config=config
+                        )
+                        
+                        # Safe text extraction (Fixes the NoneType strip crash)
+                        text = ""
+                        try:
+                            text = (response.text or "").strip()
+                        except ValueError:
+                            pass
+                        
+                        if text:
+                            return text
+                            
+                        # Null-safe fallback if it returned reasoning but no standard text
+                        if hasattr(response, 'candidates') and response.candidates:
+                            for candidate in response.candidates:
+                                if hasattr(candidate, 'content') and candidate.content:
+                                    if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                        for part in candidate.content.parts:
+                                            if hasattr(part, 'text') and part.text:
+                                                return part.text.strip()
+                        
+                        return "none"
+                except ImportError:
+                    pass # Fallback to litellm
+                except Exception as e:
+                    print(f"\nNative GenAI SDK failed: {e}\nFalling back to litellm...")
+            # --- END GEMINI 3.X NATIVE INTERCEPTOR ---
+
             r = _litellm.completion(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
@@ -564,6 +615,12 @@ class LLM:
         if not resp or not resp.strip():
             print(f"    WARNING: LLM returned empty rules for {rel} — using 'none'")
             return "none"
+        
+        # Strip "rules:" prefix if reasoning model hallucinated it
+        resp = resp.strip()
+        if resp.lower().startswith("rules:"):
+            resp = resp[6:].strip()
+            
         return resp
 
     def package_purpose(self, pkg_name: str, key_files: list[str], exports_sample: str) -> str:
